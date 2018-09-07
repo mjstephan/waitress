@@ -137,7 +137,8 @@ class MultiSocketServer(object):
 
 
 class BaseWSGIServer(wasyncore.dispatcher, object):
-
+    # By default we don't trust any of the proxy headers sent by a client
+    trusted_proxy = False
     channel_class = HTTPChannel
     next_channel_cleanup = 0
     socketmod = socket # test shim
@@ -338,6 +339,8 @@ class TcpWSGIServer(BaseWSGIServer):
 if hasattr(socket, 'AF_UNIX'):
 
     class UnixWSGIServer(BaseWSGIServer):
+        # We can implicitly trust proxy headers received over a Unix socket.
+        trusted_proxy = True
 
         def __init__(self,
                      application,
