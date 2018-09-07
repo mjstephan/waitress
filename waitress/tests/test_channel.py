@@ -653,6 +653,7 @@ class DummyAdjustments(object):
     max_request_header_size = 10000
 
 class DummyServer(object):
+    trusted_proxy = False
     trigger_pulled = False
     adj = DummyAdjustments()
 

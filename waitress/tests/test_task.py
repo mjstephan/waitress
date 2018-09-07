@@ -971,6 +971,7 @@ class DummyAdj(object):
     trusted_proxy = None
 
 class DummyServer(object):
+    trusted_proxy = False
     server_name = 'localhost'
     effective_port = 80
 
