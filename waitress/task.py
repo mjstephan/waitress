@@ -156,6 +156,7 @@ class Task(object):
     content_bytes_written = 0
     logged_write_excess = False
     logged_write_no_body = False
+    logged_multi_proxy_headers = False
     complete = False
     chunked_response = False
     logger = logger
@@ -508,6 +509,141 @@ class WSGITask(Task):
             if hasattr(app_iter, 'close'):
                 app_iter.close()
 
+    def parse_proxy_headers(self, environ, headers):
+        forwarded_for = None
+        client_addr = None
+
+        forwarded_for = None
+
+        if 'X_FORWARDED_FOR' in headers:
+            forwarded_for = []
+
+            for forward_hop in headers['X_FORWARDED_FOR'].split(','):
+                forward_hop = forward_hop.strip()
+
+                # Make sure that all IPv6 addresses are surrounded by brackets
+
+                if ':' in forward_hop and forward_hop[-1] != ']':
+                    forwarded_for.append('[{}]'.format(forward_hop))
+                else:
+                    forwarded_for.append(forward_hop)
+
+            client_addr, forwarded_for = forwarded_for[0], forwarded_for[1:]
+
+        forwarded_host = headers.get('X_FORWARDED_HOST', None)
+        forwarded_proto = headers.get('X_FORWARDED_PROTO', None)
+        forwarded_port = headers.get('X_FORWARDED_PORT', None)
+        forwarded_by = headers.get('X_FORWARDED_BY', None)
+        forwarded = headers.get('FORWARDED', None)
+
+        # If the Forwarded header exists, it gets priority, and will warn if
+        # the other headers were not None and discard them.
+
+        if forwarded:
+            if (
+                    (
+                        forwarded_host or
+                        forwarded_proto or
+                        forwarded_port or
+                        forwarded_by
+                    ) and self.logged_multi_proxy_headers is False
+            ):
+                self.logger.warning(
+                    'The Forwarded header was found to exist alongside '
+                    'one or more of the older X-Forwarded-Host, '
+                    'X-Forwarded-Proto, X-Forwarded-For, '
+                    'X-Forwarded-Port, X-Forwarded-By headers. Waitress will '
+                    'ignore the older style headers, but this could be a '
+                    'security issue. Please make sure to remove the invalid '
+                    'headers before passing the request to Waitress.'
+                )
+
+                for header in {
+                    'X_FORWARDED_FOR', 'X_FORWARDED_HOST',
+                    'X_FORWARDED_PROTO', 'X_FORWARDED_PORT',
+                    'X_FORWARDED_BY',
+                }:
+                    headers.pop(header, None)
+
+                forwarded_for = forwarded_host = forwarded_proto = None
+                forwarded_port = forwarded_by = None
+
+            def _undquote(myval):
+                if '"' in myval:
+                    return myval.strip().strip('"')
+
+                return myval
+
+            for parameter in forwarded.split(';'):
+                parameter = parameter.strip().lower()
+
+                if parameter.startswith('by'):
+                    forwarded_by = _undquote(parameter.split('=', 1)[1])
+
+                if parameter.startswith('for'):
+                    forwarded_for = []
+
+                    for for_param in parameter.split(','):
+                        for_param = for_param.strip()
+
+                        if not for_param.startswith('for'):
+                            raise ValueError(
+                                'Invalid Forwarded For parameter provided.')
+
+                        forwarded_for.append(
+                            _undquote(parameter.split('=', 1)[1]))
+
+                    client_addr, forwarded_for = (
+                        forwarded_for[0], forwarded_for[1:])
+
+                if parameter.startswith("host"):
+                    forwarded_host = _undquote(parameter.split('=', 1)[1])
+
+                if parameter.startswith("proto"):
+                    forwarded_proto = parameter.split('=', 1)[1].strip()
+
+        if forwarded_proto:
+            forwarded_proto = forwarded_proto.lower()
+
+            if forwarded_proto not in {'http', 'https'}:
+                raise ValueError(
+                    'Invalid "Forwarded Proto=" or "X-Forwarded-For" value.')
+
+            # Set the URL scheme to the proxy privided proto
+            environ['wsgi.url_scheme'] = forwarded_proto
+
+            if not forwarded_port:
+                if forwarded_proto == 'http':
+                    forwarded_port = 80
+
+                if forwarded_proto == 'https':
+                    forwarded_port = 443
+
+        if forwarded_host:
+            if ':' in forwarded_host and forwarded_host[-1] != ']':
+                host, port = forwarded_host.rsplit(':', 1)
+                host, port = host.strip(), str(port)
+
+                if forwarded_port != port:
+                    forwarded_port = port
+            else:
+                host = forwarded_host.strip()
+
+            # We trust the proxy server's forwarded Host
+            environ['SERVER_NAME'] = host
+            environ['HTTP_HOST'] = host
+
+        if forwarded_port:
+            environ['SERVER_PORT'] = forwarded_port
+
+        if client_addr:
+            if ':' in client_addr and client_addr[-1] != ']':
+                addr, port = client_addr.rsplit(':', 1)
+                environ['REMOTE_ADDR'] = addr.strip()
+                environ['REMOTE_PORT'] = port.strip()
+            else:
+                environ['REMOTE_ADDR'] = client_addr.strip()
+
     def get_environment(self):
         """Returns a WSGI environment."""
         environ = self.environ
@@ -551,16 +687,23 @@ class WSGITask(Task):
         environ['SCRIPT_NAME'] = url_prefix
         environ['PATH_INFO'] = path
         environ['QUERY_STRING'] = request.query
-        host = environ['REMOTE_ADDR'] = channel.addr[0]
+        remote_peer = environ['REMOTE_ADDR'] = channel.addr[0]
 
         headers = dict(request.headers)
-        if host == server.adj.trusted_proxy:
-            wsgi_url_scheme = headers.pop('X_FORWARDED_PROTO',
-                                          request.url_scheme)
+
+        if remote_peer == server.adj.trusted_proxy or server.trusted_proxy:
+            self.parse_proxy_headers(environ, headers)
         else:
-            wsgi_url_scheme = request.url_scheme
-        if wsgi_url_scheme not in ('http', 'https'):
-            raise ValueError('Invalid X_FORWARDED_PROTO value')
+            # If we are not relying on a proxy, we still want to try and set
+            # the REMOTE_PORT to something useful, maybe None though.
+            environ['REMOTE_PORT'] = str(channel.addr[1])
+
+        # Nah, we aren't actually going to look up the reverse DNS for
+        # REMOTE_ADDR, but we will happily set this environment variable for
+        # the WSGI application. Spec says we can just set this to REMOTE_ADDR,
+        # so we do.
+        environ['REMOTE_HOST'] = environ['REMOTE_ADDR']
+
         for key, value in headers.items():
             value = value.strip()
             mykey = rename_headers.get(key, None)
@@ -571,14 +714,19 @@ class WSGITask(Task):
 
         # the following environment variables are required by the WSGI spec
         environ['wsgi.version'] = (1, 0)
-        environ['wsgi.url_scheme'] = wsgi_url_scheme
-        environ['wsgi.errors'] = sys.stderr # apps should use the logging module
+
+        # May have already been set by the proxy
+
+        if 'wsgi.url_scheme' not in environ:
+            environ['wsgi.url_scheme'] = request.url_scheme
+        # apps should use the logging module
+        environ['wsgi.errors'] = sys.stderr
         environ['wsgi.multithread'] = True
         environ['wsgi.multiprocess'] = False
         environ['wsgi.run_once'] = False
         environ['wsgi.input'] = request.get_body_stream()
         environ['wsgi.file_wrapper'] = ReadOnlyFileBasedBuffer
-        environ['wsgi.input_terminated'] = True # wsgi.input is EOF terminated
+        environ['wsgi.input_terminated'] = True  # wsgi.input is EOF terminated
 
         self.environ = environ
         return environ
